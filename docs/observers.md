@@ -30,14 +30,19 @@ Gadgets enforce a core security invariant (see `overview.md` §"Security Model")
 > able to read that information will also be prohibited from interacting with the Gadget,
 > to prevent data leaks.
 
-Today the only mechanism enforcing this is the blunt **`prohibitAllSharing`** flag
-(`packages/workshop-shared/src/gatekeeper.ts`, `ObservationDescription.prohibitAllSharing`).
-When a gatekeeper marks an observation as maximally sensitive, the Gadget can no longer be
-shared with *anyone*, and it drops into "lockdown" (no further actions, no web fetches). This
-is a deliberate stopgap — it cannot express "this data may be shared, but only with people who
-*also* have access to it."
+Before observers landed, the only mechanism enforcing this was the blunt
+**`prohibitAllSharing`** flag (since renamed **`containsRestrictedData`**;
+`packages/workshop-shared/src/gatekeeper.ts`, `ObservationDescription.containsRestrictedData`).
+When a gatekeeper marked an observation as maximally sensitive, the Gadget could no longer be
+shared with *anyone*, and it dropped into "lockdown" (no further actions, no web fetches). That
+was a deliberate stopgap — it could not express "this data may be shared, but only with people
+who *also* have access to it." Today the flag still latches the workspace into a restricted mode
+(no actions, no web fetches), but sharing is governed by the per-user, gatekeeper-mediated check
+described here: a sensitive observation is blocked only if some current collaborator has not been
+verified (via `addObserver`) against the gatekeeper producing it — see the coverage guard,
+`#assertSensitiveObservationCoverage`, in `overseer.ts`.
 
-This feature replaces that all-or-nothing posture with a per-user, gatekeeper-mediated check:
+This feature is that per-user, gatekeeper-mediated check:
 
 - **Observers.** Every non-owner who can see data the Gadget read is an *observer*. When a user
   becomes an observer, each relevant gatekeeper is asked — via `Gatekeeper.addObserver()` — to
@@ -93,7 +98,7 @@ This feature replaces that all-or-nothing posture with a per-user, gatekeeper-me
 | Overseer DO, `open()` auth entry point | `packages/workshop-backend/src/overseer.ts:2714` |
 | Server `openGadget` path | `packages/workshop-backend/src/server.ts:206` |
 | Role resolution / permission graph | `packages/workshop-backend/src/sharing.ts` (`getEffectiveRole`, `computeEffectiveRoles`, `hasAnyShares`) |
-| `prohibitAllSharing` enforcement | `overseer.ts:1171` (`authorizeObservation`), `:1207` (web fetch), `:1258` (`submitAction`) |
+| `containsRestrictedData` enforcement | `overseer.ts` (`authorizeObservation` coverage guard, `getWebFetchEnv`, `submitAction`) |
 | Observation recording | `overseer.ts:1169` `authorizeObservation()`; `ApprovalQueueImpl` `overseer.ts:4856` |
 | Gatekeeper storage record | `overseer.ts:110` `GatekeeperRecord` (has `creationSpec.vendorId`) |
 | `GatekeeperCreationSpec` | `packages/workshop-shared/src/api.ts:1345` |
@@ -227,8 +232,9 @@ type ObserverAccountChoice = {
 ### Step 3 — Overseer: observer configuration & re-verification at `open()`
 
 Hook into `open()` in the non-owner branch, after `effectiveRole` is confirmed and before
-constructing the client interface. Keep the existing `prohibitAllSharing` short-circuit ahead of
-this -- lockdown still wins. The `NeedsConnections` signal is produced only *after* a valid role is
+constructing the client interface. (There is no longer a `containsRestrictedData` short-circuit
+ahead of this: observer verification *is* the enforcement for sensitive data at open() time.)
+The `NeedsConnections` signal is produced only *after* a valid role is
 confirmed, so it never reveals a workspace's gatekeeper or resource metadata to an unauthorized
 user.
 
@@ -402,8 +408,13 @@ already in the JSDoc in `gatekeeper.ts`; add anything missing there rather than 
 3. **Underlying resource access revoked** — caught at the next open because `addObserver`
    re-runs the live check and throws; the open is denied. Consistent with the lazy-revocation
    model in `sharing.ts`.
-4. **`prohibitAllSharing` interaction** — unchanged and still authoritative: if set, no non-owner
-   can open at all (`overseer.ts:2770`). Observer checks only matter when sharing is allowed.
+4. **`containsRestrictedData` interaction** — no longer a wholesale block. A sensitive
+   observation is admitted only if every current collaborator holds an observer record covering
+   the producing gatekeeper (`#assertSensitiveObservationCoverage` in `authorizeObservation`);
+   otherwise it is blocked with a message naming the unverified collaborator. At open() time,
+   `ensureObserver` re-verifies each collaborator against every in-scope gatekeeper, which is
+   what admits (or refuses) them for sensitive data. The flag still latches the workspace into a
+   restricted mode that blocks actions and web fetches.
 5. **Owner adds a new binding after sharing** — existing observers see an incremental modal for
    just the new binding on their next open, and may be denied if they lack access to the new
    resource (inherent to the security model).
@@ -474,8 +485,10 @@ gatekeeper package — a single package (e.g. `gatekeeper-google`) may use sever
 its resource types.
 
 - **A — Private-only.** Non-owner observers are refused: `addObserver()` unconditionally throws.
-  This is the replacement for today's reliance on `prohibitAllSharing` for these resources (the
-  `prohibitAllSharing` lockdown mechanism itself is unchanged and remains available separately).
+  This is the replacement for the old reliance on wholesale sharing prohibition for these
+  resources (the `containsRestrictedData` restricted mode -- no actions, no web fetches -- is
+  unchanged and remains available separately; combined with strategy A it makes the workspace
+  effectively private once sensitive data is observed).
   `getVerifier()` must still exist (the overseer mints one on every open) but is never consulted.
 
 - **B — ACL check (single unit).** The resource is treated as one atomic unit.

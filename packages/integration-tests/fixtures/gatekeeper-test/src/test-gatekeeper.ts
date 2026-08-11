@@ -20,7 +20,7 @@
 // is one control knob here, `allow`, and the reason string is what carries the distinction to the
 // user. Tests exercise both narratives by choosing reason text.
 
-import { DurableObject, WorkerEntrypoint, type RpcStub } from "cloudflare:workers";
+import { DurableObject, RpcTarget, WorkerEntrypoint, type RpcStub } from "cloudflare:workers";
 import type {
   AccountDescription, ActionKind, ApprovalQueue, Gatekeeper, GatekeeperConnectCallback,
   GatekeeperUser, GatekeeperUserVerifier, ResourceDescription, ResourceConfiguratorFrame,
@@ -217,8 +217,41 @@ export class TestVerifier
 // ---------------------------------------------------------------------------
 // Gatekeeper (one per bound resource, running as a facet under the gadget's Overseer)
 
-/** No operations: these tests never open a gadget's session, only verify observers. */
-export type TestSession = Record<string, never>;
+/**
+ * A live session against a Test Thing, opened via `GatekeeperClient.openSession()`.
+ *
+ * The two methods exist so tests can drive the overseer's observation/action policy through the
+ * same `ApprovalQueue` funnel a shipping gatekeeper uses: `readThing()` records an observation
+ * (optionally marked `containsRestrictedData`, to trip the sensitive-data coverage guard and the
+ * restricted-mode latch), and `doThing()` submits an action (which restricted mode blocks).
+ */
+export class TestSession extends RpcTarget {
+  #queue: RpcStub<ApprovalQueue>;
+  #title: string;
+
+  constructor(queue: RpcStub<ApprovalQueue>, title: string) {
+    super();
+    this.#queue = queue;
+    this.#title = title;
+  }
+
+  async readThing(restricted?: boolean): Promise<string> {
+    await this.#queue.authorizeObservation({
+      title: `Read ${this.#title}`,
+      description: `The test read ${this.#title}.`,
+      ...(restricted ? { containsRestrictedData: true } : {}),
+    });
+    return `the contents of ${this.#title}`;
+  }
+
+  async doThing(): Promise<void> {
+    await this.#queue.submitAction(0, {
+      title: `Poke ${this.#title}`,
+      description: `The test poked ${this.#title}.`,
+      implementsRevert: false,
+    });
+  }
+}
 
 export class TestGatekeeper
     extends DurableObject<Cloudflare.Env, BindingProps> implements Gatekeeper<TestSession> {
@@ -251,8 +284,15 @@ export class TestGatekeeper
     return [];
   }
 
-  async startSession(_approvalQueue: RpcStub<ApprovalQueue>): Promise<TestSession> {
-    return {};
+  async startSession(approvalQueue: RpcStub<ApprovalQueue>): Promise<TestSession> {
+    // The session calls the queue after startSession() returns, so it owns a duplicate.
+    let queue = approvalQueue.dup();
+    try {
+      return new TestSession(queue, (await this.describe()).title);
+    } catch (err) {
+      queue[Symbol.dispose]?.();
+      throw err;
+    }
   }
 
   /**

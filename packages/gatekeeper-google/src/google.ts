@@ -1963,8 +1963,9 @@ export class GmailGatekeeperImpl extends DurableObject<Env, GmailGatekeeperImplP
    * personal to extend to any non-owner observer (a Gmail mailbox has no per-recipient ACL we could
    * verify an observer against — the mailing-list decomposition discussed in the plan is explicitly
    * out of scope). So no non-owner observer may ever observe Gmail data: addObserver always throws.
-   * (This is enforced here in addition to any prohibitAllSharing usage, so the lockdown holds even
-   * when sharing is otherwise permitted.) removeObserver is a no-op since none is ever recorded.
+   * (This is enforced here in addition to any containsRestrictedData usage, so the restriction
+   * holds even when sharing is otherwise permitted.) removeObserver is a no-op since none is ever
+   * recorded.
    */
   async addObserver(_id: string, _user: Fetcher<GatekeeperUserVerifier>): Promise<void> {
     throw new Error(
@@ -3624,7 +3625,7 @@ class BigQuerySessionImpl extends RpcTarget implements BigQuerySession {
         `Referenced tables: ${estimate.referencedTables.join(", ")}\n` +
         `Estimated bytes processed: ${estimate.bytesProcessed.toLocaleString()}\n` +
         `Maximum bytes billed: ${maxBytes.toLocaleString()}.`,
-      prohibitAllSharing: true,
+      containsRestrictedData: true,
     });
 
     let result = await this.#api.query(billingProject, sql, {
@@ -3656,7 +3657,7 @@ class BigQuerySessionImpl extends RpcTarget implements BigQuerySession {
       description:
         `Estimated bytes processed: ${estimate.bytesProcessed.toLocaleString()}\n` +
         `Referenced tables: ${estimate.referencedTables.join(", ") || "(none)"}`,
-      prohibitAllSharing: true,
+      containsRestrictedData: true,
     });
 
     return estimate;
@@ -3668,7 +3669,7 @@ class BigQuerySessionImpl extends RpcTarget implements BigQuerySession {
     await this.#authorizeDatasets([], {
       title: "Get BigQuery project",
       description: `Returned the scoped project: \`${this.#scopedProjectId}\`.`,
-      prohibitAllSharing: true,
+      containsRestrictedData: true,
     });
     return result;
   }
@@ -3689,7 +3690,7 @@ class BigQuerySessionImpl extends RpcTarget implements BigQuerySession {
       await this.#authorizeDatasets([{ projectId: p, datasetId: this.#scopedDatasetId }], {
         title: `List datasets in ${p}`,
         description: `Returned scoped dataset \`${p}.${this.#scopedDatasetId}\` (1 dataset).`,
-        prohibitAllSharing: true,
+        containsRestrictedData: true,
       });
       return [dataset];
     }
@@ -3699,7 +3700,7 @@ class BigQuerySessionImpl extends RpcTarget implements BigQuerySession {
     await this.#authorizeDatasets(result.map(ds => ({ projectId: p, datasetId: ds.datasetId })), {
       title: `List datasets in ${p}`,
       description: `Listed ${result.length} dataset(s) in \`${p}\`.`,
-      prohibitAllSharing: true,
+      containsRestrictedData: true,
     });
     return result;
   }
@@ -3725,7 +3726,7 @@ class BigQuerySessionImpl extends RpcTarget implements BigQuerySession {
       await this.#authorizeDatasets([{ projectId: p, datasetId: d }], {
         title: `List tables in ${p}.${d}`,
         description: `Returned scoped table \`${p}.${d}.${this.#scopedTableId}\` (1 table).`,
-        prohibitAllSharing: true,
+        containsRestrictedData: true,
       });
       return [table];
     }
@@ -3734,7 +3735,7 @@ class BigQuerySessionImpl extends RpcTarget implements BigQuerySession {
     await this.#authorizeDatasets([{ projectId: p, datasetId: d }], {
       title: `List tables in ${p}.${d}`,
       description: `Listed ${result.length} table(s) in \`${p}.${d}\`.`,
-      prohibitAllSharing: true,
+      containsRestrictedData: true,
     });
     return result;
   }
@@ -3771,7 +3772,7 @@ class BigQuerySessionImpl extends RpcTarget implements BigQuerySession {
       title: `Describe ${p}.${d}.${t}`,
       description:
         `Described table \`${p}.${d}.${t}\` (${result.schema.length} columns).`,
-      prohibitAllSharing: true,
+      containsRestrictedData: true,
     });
     return result;
   }
