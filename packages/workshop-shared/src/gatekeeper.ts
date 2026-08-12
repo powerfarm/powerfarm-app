@@ -1073,9 +1073,11 @@ export type ObservationDescription = {
    *   coverage guard). Collaborators are (re-)verified every time they open the gadget, so a
    *   gatekeeper whose `addObserver()` always throws is effectively unshareable once it has made
    *   one of these observations.
-   * - Once observed, the gadget goes into a restricted mode where it can no longer perform any
-   *   actions or fetch from the public web, only make observations. This prevents the gadget
-   *   from leaking the data through other gatekeepers.
+   * - Once observed, the gadget goes into a restricted mode: it may no longer fetch from the
+   *   public web, and it may only perform actions that target a gatekeeper that itself produced
+   *   a sensitive observation (writes-to-self -- sending the data back where it came from
+   *   reveals nothing new), each requiring manual human approval (never auto-approved). This
+   *   prevents the gadget from leaking the data through other gatekeepers.
    *
    * TODO(someday): The restricted mode is still a blunt instrument. It should be possible to
    *   perform actions whose visibility is limited to people verified to have access to the same
@@ -1177,6 +1179,17 @@ export type ActionDescription = {
    * that judgement here.
    */
   autoApprovable?: boolean;
+
+  /**
+   * Gatekeeper-authored warnings addressed to the human approver, rendered prominently on the
+   * approval card ahead of the description. Use these when the gatekeeper knows something about
+   * the *context* of the action that the action's own content can't show -- e.g. "this
+   * conversation has read data from other accounts, which could leak into this write."
+   *
+   * A warning exists precisely to be read by a human, so any action carrying one is never
+   * auto-approved, even if `autoApprovable` is set and a matching rule exists.
+   */
+  operatorWarnings?: string[];
 
   // ----------------------------------------------------------------------------
   // Policy hints

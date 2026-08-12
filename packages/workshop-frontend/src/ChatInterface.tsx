@@ -45,6 +45,7 @@ import {
   PencilSimple,
   Brain,
   ShieldCheck,
+  ShieldWarning,
   Terminal,
   Globe,
   MagnifyingGlass,
@@ -6471,6 +6472,23 @@ function ChatInterface({
     // decision. Resolved actions are history, and collapse so a long thread stays scannable.
     const showDescription = isPending || open;
     const metadata = log.resourceTitle;
+    // Gatekeeper-authored warnings for the human approver: rendered prominently ahead of the
+    // description in both presentations. Their presence also suppresses the always-approve
+    // affordance below (the backend never auto-approves a warned action regardless).
+    const operatorWarnings = log.description.operatorWarnings ?? [];
+    const warningStrip = operatorWarnings.length > 0 ? (
+      <div className="mt-1 space-y-1">
+        {operatorWarnings.map((warning, i) => (
+          <div
+            key={i}
+            className="flex items-start gap-2 rounded-lg bg-kumo-warning-tint px-2.5 py-1.5 text-[12px] leading-[17px] text-kumo-default"
+          >
+            <ShieldWarning size={14} weight="duotone" className="mt-0.5 flex-shrink-0 text-kumo-warning" />
+            <span className="min-w-0">{warning}</span>
+          </div>
+        ))}
+      </div>
+    ) : null;
     const stateLabel = isApproved
       ? "Approved"
       : isRejected
@@ -6485,7 +6503,10 @@ function ChatInterface({
     // auto-approvable action with an existing rule wouldn't still be pending.)
     const autoApproveTarget =
       log.gatekeeperId !== undefined && log.description.actionKind !== undefined &&
-      log.description.autoApprovable === true
+      log.description.autoApprovable === true &&
+      // A warned action is never auto-approved (see autoApprovalRule in the backend), so don't
+      // offer the rule from it.
+      operatorWarnings.length === 0
         ? {
             actionId: msg.actionId,
             gatekeeperId: log.gatekeeperId,
@@ -6564,6 +6585,7 @@ function ChatInterface({
                   </span>
                   {resourceMeta}
                 </div>
+                {warningStrip}
                 <div className={`chat-panel mt-1 max-h-[200px] overflow-y-auto pr-1 text-[13px] leading-[18px] text-kumo-subtle ${styles.markdownContent}`}>
                   <MarkdownMessage message={log.description.description} />
                 </div>
@@ -6624,6 +6646,7 @@ function ChatInterface({
         )}
         {showDescription && (
           <div className="themed-surface-inset ml-8 mt-1 space-y-1.5 rounded-2xl border border-kumo-line/70 bg-kumo-elevated/45 p-3 text-[13px] leading-[19px] tracking-[-0.25px] text-kumo-subtle">
+            {warningStrip}
             <div className={`chat-panel max-h-[200px] overflow-y-auto pr-1 ${styles.markdownContent}`}>
               <MarkdownMessage message={log.description.description} />
             </div>

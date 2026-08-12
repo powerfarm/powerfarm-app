@@ -1,12 +1,21 @@
 import { describe, it, expect } from "vitest";
 import { createTypedStorage, collection } from "@gadgets/typed-storage";
-import { AutoApprovalDrainer, AutoApprovalStorage, ApplyPendingActionFn } from "../src/auto-approval.js";
+import {
+  AutoApprovalDrainer, AutoApprovalStorage, ApplyPendingActionFn, autoApprovalRule,
+  isSensitiveGatekeeper,
+} from "../src/auto-approval.js";
+import { computeSensitiveGatekeeperBackfill } from "../src/overseer.js";
 import type { ActionRecord, AutoApproveTagRecord } from "../src/overseer.js";
 import type { AiChatAuthorInfo } from "@gadgets/workshop-shared/api";
+import type { ActionDescription } from "@gadgets/workshop-shared/gatekeeper";
 import { makeMockStorage } from "./mock-storage.js";
 
 function makeStorage(): AutoApprovalStorage {
   return createTypedStorage(makeMockStorage(), {
+    singletons: {
+      prohibitAllSharing: false,
+      sensitiveGatekeeperIds: <number[]>[],
+    },
     collections: {
       actions: collection<ActionRecord>()({ primaryKey: "id" }),
       autoApproveTags: collection<AutoApproveTagRecord>()({
@@ -27,7 +36,7 @@ function enableRule(storage: AutoApprovalStorage, actionTag = "edit", gatekeeper
 function putAction(
     storage: AutoApprovalStorage, id: number,
     opts: { gatekeeperId?: number; actionTag?: string; autoApprovable?: boolean;
-            state?: ActionRecord["state"] } = {}) {
+            operatorWarnings?: string[]; state?: ActionRecord["state"] } = {}) {
   storage.actions.put({
     id,
     gatekeeperId: opts.gatekeeperId ?? GK,
@@ -42,6 +51,7 @@ function putAction(
       implementsRevert: true,
       actionKind: { tag: opts.actionTag ?? "edit", label: "Edits" },
       autoApprovable: opts.autoApprovable ?? true,
+      ...(opts.operatorWarnings ? { operatorWarnings: opts.operatorWarnings } : {}),
     },
   });
 }
@@ -210,5 +220,167 @@ describe("AutoApprovalDrainer.drain", () => {
     expect(apply.calls).toEqual([1, 2]);
     expect(getAction(storage, 1).state).toBe("approved");
     expect(getAction(storage, 2).state).toBe("approved");
+  });
+});
+
+// A description that passes every gate, for the predicate tests to knock single gates out of.
+function eligibleDescription(overrides: Partial<ActionDescription> = {}): ActionDescription {
+  return {
+    title: "Edit the thing",
+    description: "Edits the thing.",
+    implementsRevert: true,
+    actionKind: { tag: "edit", label: "Edits" },
+    autoApprovable: true,
+    ...overrides,
+  };
+}
+
+describe("autoApprovalRule", () => {
+  it("returns the enabling rule when every gate passes", () => {
+    let storage = makeStorage();
+    enableRule(storage);
+    let rule = autoApprovalRule(storage, GK, eligibleDescription());
+    expect(rule?.enabledBy).toEqual(ENABLER);
+  });
+
+  it("requires the author's autoApprovable verdict", () => {
+    let storage = makeStorage();
+    enableRule(storage);
+    expect(autoApprovalRule(storage, GK, eligibleDescription({ autoApprovable: undefined })))
+        .toBeUndefined();
+    expect(autoApprovalRule(storage, GK, eligibleDescription({ autoApprovable: false })))
+        .toBeUndefined();
+  });
+
+  it("requires an actionKind", () => {
+    let storage = makeStorage();
+    enableRule(storage);
+    expect(autoApprovalRule(storage, GK, eligibleDescription({ actionKind: undefined })))
+        .toBeUndefined();
+  });
+
+  it("requires a user-enabled rule for the kind on this gatekeeper", () => {
+    let storage = makeStorage();
+    expect(autoApprovalRule(storage, GK, eligibleDescription())).toBeUndefined();
+    enableRule(storage, "edit", GK + 1);  // right tag, wrong gatekeeper
+    expect(autoApprovalRule(storage, GK, eligibleDescription())).toBeUndefined();
+    enableRule(storage, "delete", GK);    // right gatekeeper, wrong tag
+    expect(autoApprovalRule(storage, GK, eligibleDescription())).toBeUndefined();
+  });
+
+  it("refuses any action carrying operator warnings", () => {
+    let storage = makeStorage();
+    enableRule(storage);
+    expect(autoApprovalRule(
+        storage, GK, eligibleDescription({ operatorWarnings: ["watch out"] })))
+        .toBeUndefined();
+    // An empty array carries no warning to read, so it does not disqualify.
+    expect(autoApprovalRule(storage, GK, eligibleDescription({ operatorWarnings: [] })))
+        .toBeDefined();
+  });
+
+  it("refuses a gatekeeper that produced a sensitive observation", () => {
+    let storage = makeStorage();
+    enableRule(storage);
+    storage.sensitiveGatekeeperIds.put([GK]);
+    expect(autoApprovalRule(storage, GK, eligibleDescription())).toBeUndefined();
+    // Another gatekeeper is unaffected by GK's taint.
+    enableRule(storage, "edit", GK + 1);
+    expect(autoApprovalRule(storage, GK + 1, eligibleDescription())).toBeDefined();
+  });
+
+  it("refuses every gatekeeper under the legacy whole-workspace restriction", () => {
+    let storage = makeStorage();
+    enableRule(storage);
+    storage.prohibitAllSharing.put(true);
+    expect(autoApprovalRule(storage, GK, eligibleDescription())).toBeUndefined();
+    expect(isSensitiveGatekeeper(storage, GK)).toBe(true);
+    expect(isSensitiveGatekeeper(storage, GK + 1)).toBe(true);
+  });
+});
+
+describe("AutoApprovalDrainer sensitive/warned gates", () => {
+  it("stops at a warned action without skipping ahead", async () => {
+    let storage = makeStorage();
+    enableRule(storage);
+    putAction(storage, 1, { operatorWarnings: ["cross-account data risk"] });
+    putAction(storage, 2);
+
+    let apply = makeImmediateApply(storage);
+    await new AutoApprovalDrainer(storage, apply.applyFn).drain(GK);
+
+    expect(apply.calls).toEqual([]);
+    expect(getAction(storage, 1).state).toBe("pending");
+    expect(getAction(storage, 2).state).toBe("pending");
+  });
+
+  it("applies nothing on a sensitive gatekeeper even with a matching rule", async () => {
+    let storage = makeStorage();
+    enableRule(storage);
+    storage.sensitiveGatekeeperIds.put([GK]);
+    putAction(storage, 1);
+
+    let apply = makeImmediateApply(storage);
+    await new AutoApprovalDrainer(storage, apply.applyFn).drain(GK);
+
+    expect(apply.calls).toEqual([]);
+    expect(getAction(storage, 1).state).toBe("pending");
+  });
+});
+
+describe("computeSensitiveGatekeeperBackfill", () => {
+  function observation(
+      id: number, gatekeeperId: number,
+      description: Record<string, unknown>): ActionRecord {
+    return {
+      id,
+      gatekeeperId,
+      caller: { from: "agent", chatId: 1 },
+      createdAt: new Date(),
+      state: "approved",
+      type: "observation",
+      description: {
+        title: `Observation ${id}`,
+        description: `Observation ${id} description`,
+        ...description,
+      },
+    } as ActionRecord;
+  }
+
+  it("collects distinct gatekeepers from sensitive observations under either flag name", () => {
+    // Records written before the rename carry `prohibitAllSharing` verbatim in storage; records
+    // written after carry `containsRestrictedData`. Both must count.
+    let actions: ActionRecord[] = [
+      observation(1, 7, { prohibitAllSharing: true }),
+      observation(2, 7, { containsRestrictedData: true }),
+      observation(3, 9, { containsRestrictedData: true }),
+      observation(4, 11, {}),
+    ];
+    expect(computeSensitiveGatekeeperBackfill(actions).toSorted()).toEqual([7, 9]);
+  });
+
+  it("ignores action records and the builtin-tool sentinel", () => {
+    let actions: ActionRecord[] = [
+      observation(1, -1, { containsRestrictedData: true }),  // builtin webFetch etc.
+      {
+        id: 2,
+        gatekeeperId: 7,
+        caller: { from: "agent", chatId: 1 },
+        createdAt: new Date(),
+        state: "pending",
+        type: "action",
+        action: 2,
+        description: {
+          title: "Act", description: "Acts.", implementsRevert: false,
+          // Hypothetical action carrying a stray flag: still not an observation.
+          containsRestrictedData: true,
+        } as ActionDescription,
+      },
+    ];
+    expect(computeSensitiveGatekeeperBackfill(actions)).toEqual([]);
+  });
+
+  it("returns nothing when no sensitive observation exists (the no-provenance safety net)", () => {
+    expect(computeSensitiveGatekeeperBackfill([observation(1, 7, {})])).toEqual([]);
   });
 });

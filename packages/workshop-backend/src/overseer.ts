@@ -35,7 +35,7 @@ import { checkUsageAndBalance } from "./ai-gateway-billing/limits/usage-checker"
 import { completeAgentCatalogSnapshot, normalizeAgentCatalog } from "./agent-catalog";
 import { refreshCachedBalance } from "./ai-gateway-billing/cloudflare/connection-service";
 import { SharingManager, SharingCaller, CollaboratorRecord, ShareKeyRecord } from "./sharing";
-import { AutoApprovalDrainer } from "./auto-approval";
+import { AutoApprovalDrainer, autoApprovalRule, isSensitiveGatekeeper } from "./auto-approval";
 import { collectSlashCommands, invokeSlashCommand } from "./slash-commands";
 import { createWorkshopLogger, obsContext, traced } from "./observability";
 import { wrapDoStubForTelemetry } from "./do-telemetry";
@@ -501,6 +501,31 @@ type ChatAttachmentContentRecord = {
 // the gatekeeper, so no lookup is ever attempted.
 const BUILTIN_TOOL_GATEKEEPER_ID = -1;
 
+// The storage schema version freshly-initialized workspaces are born at, and that
+// #migrateStorage migrates old workspaces up to. The meaning of each version is documented on
+// the `version` singleton in makeOverseerStorage.
+const CURRENT_STORAGE_VERSION = 2;
+
+/**
+ * The v1 -> 2 backfill scan (see #migrateV1ToV2): the distinct gatekeeper ids that produced at
+ * least one sensitive observation. Old records were written before `prohibitAllSharing` was
+ * renamed to `containsRestrictedData`, so both names are honored. The builtin-tool sentinel is
+ * skipped: it is not a real gatekeeper and can never be an action target. Exported for tests.
+ */
+export function computeSensitiveGatekeeperBackfill(actions: Iterable<ActionRecord>): number[] {
+  let ids = new Set<number>();
+  for (let record of actions) {
+    if (record.type !== "observation") continue;
+    if (record.gatekeeperId === BUILTIN_TOOL_GATEKEEPER_ID) continue;
+    let description = record.description as
+        ObservationDescription & {prohibitAllSharing?: boolean};
+    if (description.containsRestrictedData || description.prohibitAllSharing) {
+      ids.add(record.gatekeeperId);
+    }
+  }
+  return [...ids];
+}
+
 export type ActionRecord = {
   id: number,
   gatekeeperId: WorkpieceId;
@@ -769,6 +794,9 @@ function makeOverseerStorage(storage: DurableObjectStorage) {
       //       binding-map seeds are derived), and agent-spawner configs hold the new
       //       `env: Record<name, WorkpieceId>` form (old `env?: string[]` allowlists rewritten,
       //       in both the creationSpec and the class stub's baked-in props).
+      //   2 = per-gatekeeper sensitive-data provenance: `sensitiveGatekeeperIds` is backfilled
+      //       from the action log where the legacy `prohibitAllSharing` boolean was set (the
+      //       boolean is cleared when the backfill succeeds; see #migrateV1ToV2).
       version: 0,
 
       // The workspace title. (Each chat, gatekeeper, and gadget has its own title, elsewhere.)
@@ -811,14 +839,24 @@ function makeOverseerStorage(storage: DurableObjectStorage) {
       nextChatId: 0,
       nextHookId: 0,
 
-      // True if any past observation was authorized that had the `containsRestrictedData` flag
-      // set in its `ObservationDescription`. While set, the workspace may not perform actions or
-      // fetch from the public web.
+      // LEGACY whole-workspace form of `sensitiveGatekeeperIds` below: true if the workspace
+      // observed sensitive (`containsRestrictedData`) data before per-gatekeeper provenance was
+      // tracked AND the v1 -> 2 migration could not backfill which gatekeeper produced it. While
+      // set, the workspace may not perform ANY actions or fetch from the public web (no
+      // writes-to-self carve-out, since the "self" is unknown). New observations never set this;
+      // they record provenance instead.
       //
       // NOTE: The name predates the flag's rename from `prohibitAllSharing`. It CANNOT be
       // renamed: the typed-storage key is the property name, so a rename would silently unlatch
       // every workspace that has already observed restricted data.
       prohibitAllSharing: false,
+
+      // Gatekeepers that have produced at least one sensitive (`containsRestrictedData`)
+      // observation. While non-empty, the workspace may only perform actions targeting these
+      // same gatekeepers (the writes-to-self carve-out) -- never auto-approved -- and may not
+      // fetch from the public web. Enforcement always considers `prohibitAllSharing` above too:
+      // the effective predicate is `legacy || provenance`.
+      sensitiveGatekeeperIds: <number[]>[],
     },
 
     collections: {
@@ -1462,7 +1500,7 @@ class OverseerImpl implements AgentHooks {
 
   // Migrate storage to the current schema version. Runs synchronously in the constructor.
   #migrateStorage(): void {
-    if (this.storage.version.get() !== 0) return;
+    if (this.storage.version.get() >= CURRENT_STORAGE_VERSION) return;
     if (this.ownerId === undefined) {
       // Brand-new (or never-initialized) DO: there is nothing to migrate. We deliberately avoid
       // writing anything here, so that probing a nonexistent DO leaves no storage behind; the
@@ -1471,9 +1509,39 @@ class OverseerImpl implements AgentHooks {
       return;
     }
 
-    // Run the whole migration in one transaction so that a mid-migration error can't leave the
-    // workspace half-migrated.
     let startedAt = Date.now();
+    if (this.storage.version.get() === 0) this.#migrateV0ToV1();
+    if (this.storage.version.get() === 1) this.#migrateV1ToV2();
+
+    this.logger.info("migrated workspace storage", {
+      event: "storage.migration.completed", durationMs: Date.now() - startedAt,
+    });
+  }
+
+  // Version 1 -> 2: backfill per-gatekeeper sensitive-data provenance. Before version 2, a
+  // sensitive (`containsRestrictedData`, née `prohibitAllSharing`) observation set only the
+  // whole-workspace `prohibitAllSharing` boolean; version 2 tracks which gatekeepers produced
+  // sensitive observations (`sensitiveGatekeeperIds`) so those same gatekeepers can accept
+  // writes-to-self. Every sensitive observation left an ActionRecord carrying its description,
+  // so provenance is recoverable by scanning them. If the workspace is latched but the scan
+  // finds nothing (it shouldn't happen, but an old bug or manual surgery could), keep the legacy
+  // boolean: the workspace stays fully action-locked rather than guessing.
+  #migrateV1ToV2(): void {
+    this.ctx.storage.transactionSync(() => {
+      if (this.storage.prohibitAllSharing.get()) {
+        let ids = computeSensitiveGatekeeperBackfill(this.storage.actions.list());
+        if (ids.length > 0) {
+          this.storage.sensitiveGatekeeperIds.put(ids);
+          this.storage.prohibitAllSharing.put(false);
+        }
+      }
+      this.storage.version.put(2);
+    });
+  }
+
+  // Version 0 -> 1: multi-gadget support. Runs in one transaction so that a mid-migration error
+  // can't leave the workspace half-migrated.
+  #migrateV0ToV1(): void {
     this.ctx.storage.transactionSync(() => {
       // Version 0 -> 1: the workspace predates multi-gadget support. If it has any gadget content
       // (code beyond the initial empty snapshot, or named bindings), register that content as the
@@ -1552,10 +1620,6 @@ class OverseerImpl implements AgentHooks {
       }
 
       this.storage.version.put(1);
-    });
-
-    this.logger.info("migrated workspace storage", {
-      event: "storage.migration.completed", durationMs: Date.now() - startedAt,
     });
   }
 
@@ -2750,7 +2814,10 @@ class OverseerImpl implements AgentHooks {
                              caller: GatekeeperCaller): Promise<void> {
     if (description.containsRestrictedData) {
       await this.#assertSensitiveObservationCoverage(gatekeeperId);
-      this.storage.prohibitAllSharing.put(true);
+      let sensitiveIds = this.storage.sensitiveGatekeeperIds.get();
+      if (!sensitiveIds.includes(gatekeeperId)) {
+        this.storage.sensitiveGatekeeperIds.put([...sensitiveIds, gatekeeperId]);
+      }
     }
 
     // Forward exclusion: the gatekeeper may name observers who must not see this observation. Since
@@ -2946,7 +3013,8 @@ class OverseerImpl implements AgentHooks {
   // Provides web-fetch with the Workers AI binding and AI Gateway config it needs to call
   // `env.WORKERS_AI.toMarkdown()`. The initiator is needed for AI Gateway metadata.
   getWebFetchEnv(): WebFetchEnv {
-    if (this.storage.prohibitAllSharing.get()) {
+    if (this.storage.prohibitAllSharing.get() ||
+        this.storage.sensitiveGatekeeperIds.get().length > 0) {
       // TODO: Disallwing fetches is a bit draconian. Ideally, we would have some way to detect
       //   if a URL is well-known, and therefore not a leak problem. E.g. if the URL is already in
       //   a search index, then it's not leaking anything. If we had a search provider we could
@@ -2996,9 +3064,22 @@ class OverseerImpl implements AgentHooks {
                      description: ActionDescription, caller: GatekeeperCaller)
       : Promise<void> {
     if (this.storage.prohibitAllSharing.get()) {
+      // Legacy whole-workspace restriction: the sensitive source is unknown, so no
+      // writes-to-self carve-out is possible.
       throw new Error(
           "This workspace has observed sensitive data. To prevent leaks, the workspace is prohibited " +
           "from performing actions.");
+    }
+
+    // Writes-to-self carve-out: once any gatekeeper has produced a sensitive observation, actions
+    // may target only those same gatekeepers -- sending the data back where it came from reveals
+    // nothing new to that system, while any other target could leak it. Such actions always
+    // require manual human approval (see autoApprovalRule).
+    let sensitiveIds = this.storage.sensitiveGatekeeperIds.get();
+    if (sensitiveIds.length > 0 && !sensitiveIds.includes(gatekeeperId)) {
+      throw new Error(
+          "This workspace has observed sensitive data from other connections. To prevent leaks, " +
+          "it may only perform actions on those same connections.");
     }
 
     let actionId = this.storage.nextActionId.get();
@@ -3022,10 +3103,9 @@ class OverseerImpl implements AgentHooks {
     this.storage.actions.put(record);
     this.#associateAction(caller, actionId);
 
-    // Same auto-approval gate as before, named because awaitDecision uses it too. The drain is
-    // deferred because applying calls back into the gatekeeper facet still awaiting submitAction.
-    let willAutoApprove = !!(description.autoApprovable && description.actionKind &&
-        this.storage.autoApproveTags.get(`${gatekeeperId}:${description.actionKind.tag}`) !== undefined);
+    // Same auto-approval gate the drainer uses, named because awaitDecision uses it too. The drain
+    // is deferred because applying calls back into the gatekeeper facet still awaiting submitAction.
+    let willAutoApprove = autoApprovalRule(this.storage, gatekeeperId, description) !== undefined;
 
     // Only agent turns suspend on awaitDecision, and only when a manual decision is pending.
     // Auto-approved actions keep the seamless behavior the user opted into.
@@ -6511,7 +6591,7 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
 
     // A workspace initialized by this version of the code is born at the current schema version;
     // there is nothing to migrate.
-    this.impl.storage.version.put(1);
+    this.impl.storage.version.put(CURRENT_STORAGE_VERSION);
   }
 
   /**
@@ -7370,7 +7450,8 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
       id: this.impl.ctx.id.toString(),
       title: this.impl.storage.title.get(),
       totalCost: this.impl.storage.totalCost.get(),
-      containsRestrictedData: this.impl.storage.prohibitAllSharing.get(),
+      containsRestrictedData: this.impl.storage.prohibitAllSharing.get() ||
+          this.impl.storage.sensitiveGatekeeperIds.get().length > 0,
       role: "build",
       defaultGadgetId: this.impl.defaultGadgetId,
     };
@@ -7389,7 +7470,8 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
       id: this.impl.ctx.id.toString(),
       title: this.impl.storage.title.get(),
       totalCost: this.impl.storage.totalCost.get(),
-      containsRestrictedData: this.impl.storage.prohibitAllSharing.get(),
+      containsRestrictedData: this.impl.storage.prohibitAllSharing.get() ||
+          this.impl.storage.sensitiveGatekeeperIds.get().length > 0,
       role: "build",
       defaultGadgetId: this.impl.defaultGadgetId,
     };
@@ -7411,9 +7493,21 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
         callback(metadata).catch(unsubscribe);
       }
     };
-    let restrictedDataSubscriber = {
+    // `containsRestrictedData` derives from two singletons (the legacy boolean and the
+    // provenance set), so subscribe to both and recompute from the one that changed plus the
+    // current value of the other.
+    let impl = this.impl;
+    let legacySubscriber = {
       update(value: boolean | undefined) {
-        metadata.containsRestrictedData = value;
+        metadata.containsRestrictedData =
+            !!value || impl.storage.sensitiveGatekeeperIds.get().length > 0;
+        callback(metadata).catch(unsubscribe);
+      }
+    };
+    let sensitiveIdsSubscriber = {
+      update(value: number[]) {
+        metadata.containsRestrictedData =
+            impl.storage.prohibitAllSharing.get() || value.length > 0;
         callback(metadata).catch(unsubscribe);
       }
     };
@@ -7421,13 +7515,15 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     let unsubscribe = () => {
       this.impl.storage.title.unsubscribe(titleSubscriber);
       this.impl.storage.totalCost.unsubscribe(costSubscriber);
-      this.impl.storage.prohibitAllSharing.unsubscribe(restrictedDataSubscriber);
+      this.impl.storage.prohibitAllSharing.unsubscribe(legacySubscriber);
+      this.impl.storage.sensitiveGatekeeperIds.unsubscribe(sensitiveIdsSubscriber);
       callback[Symbol.dispose]();
     };
 
     this.impl.storage.title.subscribe(titleSubscriber);
     this.impl.storage.totalCost.subscribe(costSubscriber);
-    this.impl.storage.prohibitAllSharing.subscribe(restrictedDataSubscriber);
+    this.impl.storage.prohibitAllSharing.subscribe(legacySubscriber);
+    this.impl.storage.sensitiveGatekeeperIds.subscribe(sensitiveIdsSubscriber);
 
     callback(metadata).catch(unsubscribe);
 
@@ -7949,6 +8045,14 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
       throw new Error(`No such gatekeeper: ${gatekeeperId}`);
     }
 
+    // A rule on a sensitive gatekeeper would never fire (see autoApprovalRule), so refuse to
+    // store one rather than let the UI suggest auto-approval is in effect.
+    if (isSensitiveGatekeeper(this.impl.storage, gatekeeperId)) {
+      throw new Error(
+          "This connection has read sensitive data, so its actions always require manual " +
+          "approval and cannot be auto-approved.");
+    }
+
     let profile = await this.#getClientProfile();
     this.impl.storage.autoApproveTags.put({
       gatekeeperId,
@@ -7990,6 +8094,9 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     let perGatekeeper = [...boundIds]
         .map(id => this.impl.storage.gatekeepers.get(id))
         .filter(gk => gk !== undefined)
+        // Sensitive gatekeepers can't have auto-approval rules (see setAutoApprovedActionKind),
+        // so don't offer their actions.
+        .filter(gk => !isSensitiveGatekeeper(this.impl.storage, gk.id))
         .map(async (gk): Promise<PreApprovableAction[]> => {
       let facet = this.impl.getGatekeeperFacet(gk.id);
       let kinds = await facet.getAutoApprovableActions();

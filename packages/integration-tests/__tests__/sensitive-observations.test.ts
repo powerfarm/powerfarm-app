@@ -125,7 +125,8 @@ async function bobOpens(ws: Workspace, bobApi: RpcStub<AuthenticatedApi>,
 }
 
 describe("sensitive observations", () => {
-  it.concurrent("latch restricted mode: actions are blocked and metadata reports it", async () => {
+  it.concurrent("latch restricted mode: only writes-to-self are allowed and metadata reports it",
+      async () => {
     await withSession(async publicApi => {
       const ws = await newWorkspace(publicApi, "latch");
 
@@ -136,7 +137,19 @@ describe("sensitive observations", () => {
       await expect(ws.session.readThing(true)).resolves.toContain("latch");
 
       expect((await ws.overseer.getMetadata()).containsRestrictedData).toBe(true);
-      await expect(ws.session.doThing()).rejects.toThrow(/prohibited from performing actions/i);
+
+      // Actions targeting the gatekeeper that produced the sensitive data still pend (the
+      // writes-to-self carve-out: the data came from there, so sending it back reveals nothing
+      // new). Actions on any other connection are blocked.
+      await expect(ws.session.doThing()).resolves.toBeUndefined();
+      const accounts = await listConnectedAccounts(ws.aliceApi);
+      const account = accounts.find(a => a.vendorId === TEST_VENDOR_ID)!;
+      const other = await ws.overseer.newGatekeeper(account.id, thingUrl("latch-other"));
+      if (!other) throw new Error("Failed to create the second test connection");
+      const otherSession: any = await other.openSession();
+      await expect(otherSession.doThing())
+          .rejects.toThrow(/only perform actions on those same connections/i);
+
       // Reads -- sensitive or not -- keep working.
       await expect(ws.session.readThing()).resolves.toContain("latch");
       await expect(ws.session.readThing(true)).resolves.toContain("latch");
