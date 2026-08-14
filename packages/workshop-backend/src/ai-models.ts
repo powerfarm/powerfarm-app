@@ -6,7 +6,7 @@ import type {
 } from "@earendil-works/pi-ai";
 import { stream as anthropicMessagesStream } from "@earendil-works/pi-ai/api/anthropic-messages";
 import {
-  CLOUDFLARE_GATEWAY_BINDING_AUTH_SENTINEL, createGatewayBindingFetch,
+  type AiFetchBinding, CLOUDFLARE_GATEWAY_BINDING_AUTH_SENTINEL, createGatewayBindingFetch,
 } from "./ai-gateway-binding-fetch.js";
 import { stream as googleGenerativeAiStream } from "@earendil-works/pi-ai/api/google-generative-ai";
 import { stream as openaiCompletionsStream } from "@earendil-works/pi-ai/api/openai-completions";
@@ -425,9 +425,9 @@ function getModelViaGateway(
 ): ModelHandle {
   const metadata = buildMetadata(initiator, options.metadata);
   // Binding transport when available (all providers except Google): requests go through
-  // env.WORKERS_AI.gateway().run(), pre-authenticated in-account. pi's API impls require a
-  // recognized auth header before dispatch, so binding-routed requests carry a sentinel
-  // cf-aig-authorization that the shim strips before it reaches the wire.
+  // env.WORKERS_AI.fetch() to the gateway's universal endpoint, pre-authenticated in-account.
+  // pi's API impls require a recognized auth header before dispatch, so binding-routed requests
+  // carry a sentinel cf-aig-authorization that the shim strips before it reaches the wire.
   const binding = gwConfig.bindingFor(config.provider);
   const gatewayAuthHeaders: ProviderHeaders = {
     // pi's API impls explicitly recognize cf-aig-authorization and skip SDK auth; the null
@@ -477,7 +477,9 @@ function getModelViaGateway(
     ...(config.provider === "google" ? { apiKey: gwConfig.apiToken } : {}),
     headers: gatewayAuthHeaders,
     ...(binding
-        ? { fetch: createGatewayBindingFetch({ binding, baseUrl: gatewayUrl, gateway }) }
+        // Ai#fetch exists at runtime but workers-types' `Ai` doesn't declare it, hence the cast.
+        ? { fetch: createGatewayBindingFetch({
+            binding: binding as unknown as AiFetchBinding, baseUrl: gatewayUrl, gateway }) }
         : {}),
     gatewayMetadata: metadata,
     sessionAffinity: options.sessionAffinity,

@@ -231,7 +231,8 @@ describe("getModel AI Gateway routing", () => {
 describe("getModel AI Gateway binding transport", () => {
   // Universal-endpoint entries captured by the fake Workers AI binding. In binding mode the
   // handle's requests never hit HTTP: pi's SDK fetch is the pi gateway-binding shim, which
-  // translates each request into binding.gateway(gw).run(entry).
+  // POSTs a [{provider, endpoint, headers, query}] envelope through binding.fetch() to the
+  // gateway's universal endpoint (workers-binding.ai/ai-gateway/universal/run/{gateway}).
   type CapturedEntry = {
     gatewayId: string;
     provider: string;
@@ -242,15 +243,15 @@ describe("getModel AI Gateway binding transport", () => {
   const capturedEntries: CapturedEntry[] = [];
 
   const fakeBinding = {
-    gateway: (gatewayId: string) => ({
-      run: async (data: Omit<CapturedEntry, "gatewayId">) => {
-        capturedEntries.push({ gatewayId, ...data });
-        // Same non-retryable client error as the HTTP fetch stub: pi surfaces an error-stop
-        // message and the entry stays captured for assertions.
-        return Response.json(
-            { error: { type: "bad_request", message: "stubbed" } }, { status: 400 });
-      },
-    }),
+    fetch: async (input: Request | string | URL, init?: RequestInit) => {
+      const gatewayId = new URL(String(input)).pathname.split("/").pop() ?? "";
+      const [entry] = JSON.parse(init?.body as string) as Omit<CapturedEntry, "gatewayId">[];
+      capturedEntries.push({ gatewayId, ...entry });
+      // Same non-retryable client error as the HTTP fetch stub: pi surfaces an error-stop
+      // message and the entry stays captured for assertions.
+      return Response.json(
+          { error: { type: "bad_request", message: "stubbed" } }, { status: 400 });
+    },
   } as unknown as Ai;
 
   // Binding transport selects by default: binding present, no API token (in-account gateways;

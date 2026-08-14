@@ -1,34 +1,41 @@
 import { describe, expect, it } from "vitest";
 import {
-  type AiGatewayUniversalRequestLike,
   CLOUDFLARE_GATEWAY_BINDING_AUTH_SENTINEL,
   createGatewayBindingFetch,
 } from "../src/ai-gateway-binding-fetch.js";
 
 const BASE_URL = "https://gateway.ai.cloudflare.com/v1/account-id/my-gateway";
+const UNIVERSAL_URL = "https://workers-binding.ai/ai-gateway/universal/run/my-gateway";
 
-type CapturedRun = {
-  gatewayId: string;
-  data: AiGatewayUniversalRequestLike;
-  options: { signal?: AbortSignal } | undefined;
+type UniversalEntry = {
+  provider: string;
+  endpoint: string;
+  headers: Record<string, string>;
+  query: unknown;
+};
+
+type CapturedFetch = {
+  input: Request | string | URL;
+  init: RequestInit | undefined;
 };
 
 function fakeBinding(response?: Response) {
-  const runs: CapturedRun[] = [];
+  const calls: CapturedFetch[] = [];
   const binding = {
-    gateway: (gatewayId: string) => ({
-      run: (data: AiGatewayUniversalRequestLike, options?: { signal?: AbortSignal }) => {
-        runs.push({ gatewayId, data, options });
-        return Promise.resolve(response ?? new Response("{}"));
-      },
-    }),
+    fetch: (input: Request | string | URL, init?: RequestInit) => {
+      calls.push({ input, init });
+      return Promise.resolve(response ?? new Response("{}"));
+    },
   };
-  return { binding, runs };
+  // The shim never parses the envelope; tests do, to assert on entries.
+  const entry = (index = 0): UniversalEntry =>
+      (JSON.parse(calls[index].init?.body as string) as UniversalEntry[])[0];
+  return { binding, calls, entry };
 }
 
 describe("createGatewayBindingFetch", () => {
   it("derives provider and endpoint from gateway passthrough URLs", async () => {
-    const { binding, runs } = fakeBinding();
+    const { binding, calls, entry } = fakeBinding();
     const fetchFn = createGatewayBindingFetch({ binding, baseUrl: BASE_URL, gateway: "my-gateway" });
 
     await fetchFn(`${BASE_URL}/anthropic/v1/messages`, {
@@ -44,17 +51,95 @@ describe("createGatewayBindingFetch", () => {
       body: JSON.stringify({ model: "@cf/meta/llama" }),
     });
 
-    expect(runs.map((run) => [run.data.provider, run.data.endpoint])).toEqual([
+    expect(calls.map((_, index) => [entry(index).provider, entry(index).endpoint])).toEqual([
       ["anthropic", "v1/messages"],
       ["openai", "responses"],
       ["workers-ai", "v1/chat/completions"],
     ]);
-    expect(runs.map((run) => run.gatewayId)).toEqual(["my-gateway", "my-gateway", "my-gateway"]);
-    expect(runs[0].data.query).toEqual({ model: "claude" });
+    expect(entry(0).query).toEqual({ model: "claude" });
+  });
+
+  it("dispatches to the gateway's universal endpoint through the binding", async () => {
+    const { binding, calls } = fakeBinding();
+    const fetchFn = createGatewayBindingFetch({ binding, baseUrl: BASE_URL, gateway: "my-gateway" });
+
+    await fetchFn(`${BASE_URL}/anthropic/v1/messages`, {
+      method: "POST",
+      body: JSON.stringify({ model: "claude" }),
+    });
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0].input).toBe(UNIVERSAL_URL);
+    expect(calls[0].init?.method).toBe("POST");
+    expect(calls[0].init?.headers).toEqual({ "content-type": "application/json" });
+  });
+
+  it("splices the body string into the envelope without re-encoding", async () => {
+    const { binding, calls } = fakeBinding();
+    const fetchFn = createGatewayBindingFetch({ binding, baseUrl: BASE_URL, gateway: "my-gateway" });
+    // Key-order and whitespace quirks a parse/re-encode round trip would not preserve.
+    const bodyText = '{ "b": 1,\n\t"a": [2,   3], "text": "line1\\nline2" }';
+
+    await fetchFn(`${BASE_URL}/anthropic/v1/messages`, { method: "POST", body: bodyText });
+
+    const envelope = calls[0].init?.body as string;
+    expect(envelope.includes(bodyText)).toBe(true);
+    expect(envelope).toBe(
+        `[{"provider":"anthropic","endpoint":"v1/messages","headers":{},"query":${bodyText}}]`);
+  });
+
+  it("locks the exact wire format of the spliced envelope", async () => {
+    const { binding, calls } = fakeBinding();
+    const fetchFn = createGatewayBindingFetch({ binding, baseUrl: BASE_URL, gateway: "my-gateway" });
+
+    await fetchFn(`${BASE_URL}/anthropic/v1/messages`, {
+      method: "POST",
+      headers: { "anthropic-version": "2023-06-01" },
+      body: '{"model":"claude"}',
+    });
+
+    expect(calls[0].init?.body).toBe(
+        '[{"provider":"anthropic","endpoint":"v1/messages",' +
+        '"headers":{"anthropic-version":"2023-06-01"},"query":{"model":"claude"}}]');
+  });
+
+  it("scans the body for a single complete JSON object without parsing it", async () => {
+    const { binding, calls, entry } = fakeBinding();
+    const fetchFn = createGatewayBindingFetch({ binding, baseUrl: BASE_URL, gateway: "my-gateway" });
+
+    // Leading/trailing JSON whitespace is fine, as are braces and escapes inside strings.
+    await fetchFn(`${BASE_URL}/anthropic/v1/messages`, {
+      method: "POST",
+      body: ' \t\r\n {"model":"claude"} \n',
+    });
+    expect(entry(0).query).toEqual({ model: "claude" });
+    await fetchFn(`${BASE_URL}/anthropic/v1/messages`, {
+      method: "POST",
+      body: '{"a":"}]{[\\"","b":[{}]}',
+    });
+    expect(entry(1).query).toEqual({ a: '}]{["', b: [{}] });
+    expect(calls).toHaveLength(2);
+
+    const reject = (body: string) =>
+        expect(fetchFn(`${BASE_URL}/anthropic/v1/messages`, { method: "POST", body }))
+            .rejects.toThrow("body is not a single JSON object");
+    // Non-object JSON values are unexpressible: the envelope's `query` must be an object.
+    await reject("not json");
+    await reject("[1]");
+    // Envelope injection: content after the object's close would escape the `query` slot and
+    // override envelope fields or add extra entries. All rejected by the balance scan.
+    await reject('{"a":1},"provider":"evil"');
+    await reject('{"q":1}},{"provider":"evil","endpoint":"x","headers":{},"query":{"q":2}');
+    await reject('{"a":1} {"b":2}');
+    // Unbalanced nesting / unterminated strings never complete the object.
+    await reject('{"a":1');
+    await reject('{"a":"');
+    await reject('{"a":1]');
+    expect(calls).toHaveLength(2);
   });
 
   it("keeps the query string in the endpoint", async () => {
-    const { binding, runs } = fakeBinding();
+    const { binding, entry } = fakeBinding();
     const fetchFn = createGatewayBindingFetch({ binding, baseUrl: BASE_URL, gateway: "my-gateway" });
 
     await fetchFn(`${BASE_URL}/openai/responses?beta=true`, {
@@ -62,11 +147,11 @@ describe("createGatewayBindingFetch", () => {
       body: "{}",
     });
 
-    expect(runs[0].data.endpoint).toBe("responses?beta=true");
+    expect(entry().endpoint).toBe("responses?beta=true");
   });
 
   it("lowercases header names so case-variant duplicates collapse", async () => {
-    const { binding, runs } = fakeBinding();
+    const { binding, entry } = fakeBinding();
     const fetchFn = createGatewayBindingFetch({ binding, baseUrl: BASE_URL, gateway: "my-gateway" });
 
     await fetchFn(`${BASE_URL}/anthropic/v1/messages`, {
@@ -75,11 +160,11 @@ describe("createGatewayBindingFetch", () => {
       body: "{}",
     });
 
-    expect(runs[0].data.headers).toEqual({ "anthropic-version": "2023-06-01" });
+    expect(entry().headers).toEqual({ "anthropic-version": "2023-06-01" });
   });
 
   it("lets init headers replace a Request input's headers, per the fetch spec", async () => {
-    const { binding, runs } = fakeBinding();
+    const { binding, entry } = fakeBinding();
     const fetchFn = createGatewayBindingFetch({ binding, baseUrl: BASE_URL, gateway: "my-gateway" });
 
     await fetchFn(
@@ -90,12 +175,12 @@ describe("createGatewayBindingFetch", () => {
         }),
         { headers: { "x-from-init": "yes" } });
 
-    expect(runs[0].data.headers["x-from-init"]).toBe("yes");
-    expect(runs[0].data.headers["x-from-request"]).toBeUndefined();
+    expect(entry().headers["x-from-init"]).toBe("yes");
+    expect(entry().headers["x-from-request"]).toBeUndefined();
   });
 
   it("strips gateway auth and derived headers, forwards the rest", async () => {
-    const { binding, runs } = fakeBinding();
+    const { binding, entry } = fakeBinding();
     const fetchFn = createGatewayBindingFetch({ binding, baseUrl: BASE_URL, gateway: "my-gateway" });
 
     await fetchFn(`${BASE_URL}/anthropic/v1/messages`, {
@@ -111,8 +196,7 @@ describe("createGatewayBindingFetch", () => {
       body: "{}",
     });
 
-    const headers = Object.fromEntries(
-        Object.entries(runs[0].data.headers).map(([key, value]) => [key.toLowerCase(), value]));
+    const headers = entry().headers;
     expect(headers["cf-aig-authorization"]).toBeUndefined();
     expect(headers["content-length"]).toBeUndefined();
     expect(headers["cf-aig-metadata"]).toBe('{"user":"42"}');
@@ -122,7 +206,7 @@ describe("createGatewayBindingFetch", () => {
   });
 
   it("accepts Request inputs and forwards their headers and body", async () => {
-    const { binding, runs } = fakeBinding();
+    const { binding, calls, entry } = fakeBinding();
     const fetchFn = createGatewayBindingFetch({ binding, baseUrl: BASE_URL, gateway: "my-gateway" });
 
     await fetchFn(new Request(`${BASE_URL}/openai/chat/completions`, {
@@ -131,15 +215,15 @@ describe("createGatewayBindingFetch", () => {
       body: JSON.stringify({ stream: true }),
     }));
 
-    expect(runs).toHaveLength(1);
-    expect(runs[0].data.provider).toBe("openai");
-    expect(runs[0].data.endpoint).toBe("chat/completions");
-    expect(runs[0].data.query).toEqual({ stream: true });
-    expect(runs[0].data.headers["content-type"]).toBe("application/json");
+    expect(calls).toHaveLength(1);
+    expect(entry().provider).toBe("openai");
+    expect(entry().endpoint).toBe("chat/completions");
+    expect(entry().query).toEqual({ stream: true });
+    expect(entry().headers["content-type"]).toBe("application/json");
   });
 
-  it("forwards the abort signal", async () => {
-    const { binding, runs } = fakeBinding();
+  it("forwards the abort signal on init", async () => {
+    const { binding, calls } = fakeBinding();
     const fetchFn = createGatewayBindingFetch({ binding, baseUrl: BASE_URL, gateway: "my-gateway" });
     const controller = new AbortController();
 
@@ -149,12 +233,12 @@ describe("createGatewayBindingFetch", () => {
       signal: controller.signal,
     });
 
-    expect(runs[0].options?.signal).toBe(controller.signal);
+    expect(calls[0].init?.signal).toBe(controller.signal);
   });
 
   it("lets an explicit `signal: null` in init clear a Request input's signal, per the fetch spec",
       async () => {
-    const { binding, runs } = fakeBinding();
+    const { binding, calls } = fakeBinding();
     const fetchFn = createGatewayBindingFetch({ binding, baseUrl: BASE_URL, gateway: "my-gateway" });
     const controller = new AbortController();
 
@@ -166,8 +250,9 @@ describe("createGatewayBindingFetch", () => {
         }),
         { signal: null });
 
-    expect(runs).toHaveLength(1);
-    expect(runs[0].options?.signal).toBeUndefined();
+    expect(calls).toHaveLength(1);
+    expect(calls[0].init && "signal" in calls[0].init ? calls[0].init.signal : undefined)
+        .toBeUndefined();
   });
 
   it("returns the binding response untouched, including streaming bodies", async () => {
@@ -195,22 +280,24 @@ describe("createGatewayBindingFetch", () => {
   });
 
   it("rejects in-prefix requests the universal endpoint cannot express", async () => {
-    const { binding, runs } = fakeBinding();
+    const { binding, calls } = fakeBinding();
     const fetchFn = createGatewayBindingFetch({ binding, baseUrl: BASE_URL, gateway: "my-gateway" });
 
     await expect(fetchFn(`${BASE_URL}/anthropic/v1/messages`, { method: "GET" }))
         .rejects.toThrow("cannot express GET");
     await expect(fetchFn(`${BASE_URL}/anthropic/v1/messages`, { method: "POST", body: "not json" }))
-        .rejects.toThrow("non-JSON body");
+        .rejects.toThrow("body is not a single JSON object");
+    await expect(fetchFn(`${BASE_URL}/anthropic/v1/messages`, { method: "POST" }))
+        .rejects.toThrow("missing body");
     await expect(fetchFn(`${BASE_URL}/anthropic`, { method: "POST", body: "{}" }))
         .rejects.toThrow("missing provider/endpoint path");
-    expect(runs).toHaveLength(0);
+    expect(calls).toHaveLength(0);
   });
 
   it("rejects URLs outside the gateway prefix: transport selection is the caller's", async () => {
     // Silent passthrough would ship the auth sentinel to whatever host the URL names; a
     // misconfigured baseUrl must fail loudly instead.
-    const { binding, runs } = fakeBinding();
+    const { binding, calls } = fakeBinding();
     const fetchFn = createGatewayBindingFetch({ binding, baseUrl: BASE_URL, gateway: "my-gateway" });
 
     await expect(fetchFn("https://api.openai.com/v1/chat/completions", { method: "POST", body: "{}" }))
@@ -220,11 +307,11 @@ describe("createGatewayBindingFetch", () => {
         "https://gateway.ai.cloudflare.com/v1/other-account/my-gateway/anthropic/v1/messages",
         { method: "POST", body: "{}" }))
         .rejects.toThrow("outside the configured gateway prefix");
-    expect(runs).toHaveLength(0);
+    expect(calls).toHaveLength(0);
   });
 
   it("matches and splits on the URL-normalized path, as real fetch would send it", async () => {
-    const { binding, runs } = fakeBinding();
+    const { binding, calls, entry } = fakeBinding();
     const fetchFn = createGatewayBindingFetch({ binding, baseUrl: BASE_URL, gateway: "my-gateway" });
 
     // Dot segments normalize away before the provider/endpoint split, so a lexical variant
@@ -233,20 +320,36 @@ describe("createGatewayBindingFetch", () => {
       method: "POST",
       body: JSON.stringify({ model: "claude" }),
     });
-    expect(runs.map((run) => [run.data.provider, run.data.endpoint])).toEqual([
-      ["anthropic", "v1/messages"],
-    ]);
+    expect([entry().provider, entry().endpoint]).toEqual(["anthropic", "v1/messages"]);
 
     // A dot-segment URL that resolves outside the prefix is rejected even though it starts
     // with the prefix as a raw string.
     await expect(fetchFn(`${BASE_URL}/../other-gateway/anthropic/v1/messages`,
         { method: "POST", body: "{}" }))
         .rejects.toThrow("outside the configured gateway prefix");
-    expect(runs).toHaveLength(1);
+    expect(calls).toHaveLength(1);
   });
 
-  it("consumes a one-shot stream body for the JSON probe", async () => {
-    const { binding, runs } = fakeBinding();
+  it("inherits a Request input's body on explicit `body: null` in init, per the fetch spec",
+      async () => {
+    // Unlike `signal`, init.body must exist AND be non-null to override: `body: null` behaves
+    // like an absent body, so the Request input's own body rides through.
+    const { binding, calls, entry } = fakeBinding();
+    const fetchFn = createGatewayBindingFetch({ binding, baseUrl: BASE_URL, gateway: "my-gateway" });
+
+    await fetchFn(
+        new Request(`${BASE_URL}/anthropic/v1/messages`, {
+          method: "POST",
+          body: JSON.stringify({ model: "claude" }),
+        }),
+        { body: null });
+
+    expect(calls).toHaveLength(1);
+    expect(entry().query).toEqual({ model: "claude" });
+  });
+
+  it("consumes a one-shot stream body for the object scan", async () => {
+    const { binding, calls, entry } = fakeBinding();
     const fetchFn = createGatewayBindingFetch({ binding, baseUrl: BASE_URL, gateway: "my-gateway" });
     const streamOf = (text: string) => new ReadableStream<Uint8Array>({
       start(controller) {
@@ -255,21 +358,21 @@ describe("createGatewayBindingFetch", () => {
       },
     });
 
-    // JSON stream body: consumed once, reaches the binding as the parsed query.
+    // JSON stream body: consumed once, spliced into the envelope as the query.
     await fetchFn(`${BASE_URL}/anthropic/v1/messages`, {
       method: "POST",
       body: streamOf('{"model":"claude"}'),
       duplex: "half",
     } as RequestInit);
-    expect(runs).toHaveLength(1);
-    expect(runs[0].data.query).toEqual({ model: "claude" });
+    expect(calls).toHaveLength(1);
+    expect(entry().query).toEqual({ model: "claude" });
 
-    // Non-JSON stream body: rejects like any other non-JSON body (never replayed).
+    // Non-object stream body: rejects like any other non-object body (never replayed).
     await expect(fetchFn(`${BASE_URL}/anthropic/v1/messages`, {
       method: "POST",
       body: streamOf("not json"),
       duplex: "half",
-    } as RequestInit)).rejects.toThrow("non-JSON body");
-    expect(runs).toHaveLength(1);
+    } as RequestInit)).rejects.toThrow("body is not a single JSON object");
+    expect(calls).toHaveLength(1);
   });
 });

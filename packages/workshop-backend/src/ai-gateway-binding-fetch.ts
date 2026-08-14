@@ -1,13 +1,32 @@
-// Cloudflare AI Gateway over the Workers AI binding.
+// Cloudflare AI Gateway over the AI binding's fetch passthrough.
+//
+// Vendored mirror of pi's (to-be-released) cloudflare-gateway-binding module; delete this file
+// and import from @earendil-works/pi-ai once a pi release ships it.
 //
 // `createGatewayBindingFetch` returns a fetch that translates requests bound for an AI Gateway
 // HTTPS endpoint (https://gateway.ai.cloudflare.com/v1/{account}/{gateway}/...) into calls
-// through the Workers AI binding's universal endpoint
-// (env.WORKERS_AI.gateway(id).run({provider, endpoint, headers, query})), which returns the
-// provider's native wire format as a regular streaming Response. Binding calls are
-// pre-authenticated in-account, so no cf-aig-authorization token is needed -- pass
-// CLOUDFLARE_GATEWAY_BINDING_AUTH_SENTINEL where an auth header is required to satisfy pi's
-// request-auth checks; the shim strips it before dispatch. Pair the sentinel with explicit
+// through the plain AI binding's fetch passthrough (env.WORKERS_AI.fetch()), targeting the
+// gateway's universal endpoint (https://workers-binding.ai/ai-gateway/universal/run/{gateway}),
+// which returns the provider's native wire format as a regular streaming Response.
+//
+// The universal endpoint takes a JSON envelope, [{provider, endpoint, headers, query}], where
+// `query` is the provider request body. The shim builds that envelope by string splicing: the
+// request body is already JSON text, so it is embedded verbatim as the `query` value without
+// ever being parsed or re-encoded in the isolate -- multi-MB prompt bodies cost one extra
+// body-sized string, not a parsed object tree. Before splicing, a single O(n) scan checks the
+// body is exactly one complete JSON object (string-aware brace balance, nothing but whitespace
+// after the close), so a malformed body cannot terminate `query` early and inject envelope
+// fields or extra entries. The trade-off vs parsing: JSON errors *inside* the object are no
+// longer caught locally and instead surface in the gateway's error response. (A future gateway
+// raw endpoint, /ai-gateway/raw/..., could drop the envelope entirely; the universal endpoint
+// is what exists today.)
+//
+// `Ai#fetch` exists at runtime but is not declared on @cloudflare/workers-types' `Ai` class,
+// hence the structural AiFetchBinding interface and the cast at the caller.
+//
+// Binding calls are pre-authenticated in-account, so no cf-aig-authorization token is needed --
+// pass CLOUDFLARE_GATEWAY_BINDING_AUTH_SENTINEL where an auth header is required to satisfy
+// pi's request-auth checks; the shim strips it before dispatch. Pair the sentinel with explicit
 // `Authorization: null` / `x-api-key: null` provider headers (a null value deletes the header
 // in the SDKs): with header-owned auth the SDKs otherwise inject a placeholder auth header
 // (e.g. `Authorization: Bearer unused`), which the shim forwards like any provider auth header
@@ -16,22 +35,13 @@
 
 import type { FetchFunction } from "@earendil-works/pi-ai";
 
-// Structural type for the Workers AI binding's gateway surface (`env.WORKERS_AI`); any real
-// `Ai` binding satisfies it.
-export interface AiGatewayBinding {
-  gateway(id: string): AiGatewayBindingGateway;
-}
-
-export interface AiGatewayBindingGateway {
-  run(data: AiGatewayUniversalRequestLike, options?: { signal?: AbortSignal }): Promise<Response>;
-}
-
-/** One universal-endpoint request entry, as accepted by `AiGateway.run()`. */
-export interface AiGatewayUniversalRequestLike {
-  provider: string;
-  endpoint: string;
-  headers: Record<string, string>;
-  query: unknown;
+/**
+ * Structural type for the AI binding's fetch passthrough (`env.WORKERS_AI.fetch()`). Any real
+ * `Ai` binding satisfies it at runtime, but the public `Ai` type does not declare `fetch`, so
+ * callers cast: `binding as unknown as AiFetchBinding`.
+ */
+export interface AiFetchBinding {
+  fetch(input: Request | string | URL, init?: RequestInit): Promise<Response>;
 }
 
 /**
@@ -46,12 +56,14 @@ export interface AiGatewayUniversalRequestLike {
 export const CLOUDFLARE_GATEWAY_BINDING_AUTH_SENTINEL = "cloudflare-gateway-binding";
 
 export interface GatewayBindingFetchOptions {
-  // The Workers AI binding (e.g. env.WORKERS_AI).
-  binding: AiGatewayBinding;
-  // Gateway HTTPS prefix every request must fall under, without a trailing slash:
-  // https://gateway.ai.cloudflare.com/v1/{accountId}/{gatewayName}.
+  /** The AI binding (e.g. env.WORKERS_AI), cast to AiFetchBinding. */
+  binding: AiFetchBinding;
+  /**
+   * Gateway HTTPS prefix every request must fall under, without a trailing slash:
+   * https://gateway.ai.cloudflare.com/v1/{accountId}/{gatewayName}.
+   */
   baseUrl: string;
-  // Gateway name passed to binding.gateway(). Must match the baseUrl gateway.
+  /** Gateway name on the universal endpoint's path. Must match the baseUrl gateway. */
   gateway: string;
 }
 
@@ -63,11 +75,11 @@ const STRIP_HEADERS = new Set(["content-length", "host", "cf-aig-authorization"]
 type FetchInput = Parameters<FetchFunction>[0];
 
 /**
- * Create a `fetch` that routes AI Gateway requests through the Workers AI binding. This is
- * the transport for one gateway-bound client, not a general-purpose fetch: URLs outside the
+ * Create a `fetch` that routes AI Gateway requests through the AI binding. This is the
+ * transport for one gateway-bound client, not a general-purpose fetch: URLs outside the
  * configured gateway prefix, and in-prefix requests the binding cannot express (non-POST,
- * non-JSON body), reject with a descriptive error. Transport selection is the caller's job,
- * per client -- route such traffic over HTTPS with real gateway auth instead.
+ * non-JSON-object body), reject with a descriptive error. Transport selection is the caller's
+ * job, per client -- route such traffic over HTTPS with real gateway auth instead.
  */
 export function createGatewayBindingFetch(options: GatewayBindingFetchOptions): FetchFunction {
   const { binding, gateway } = options;
@@ -76,6 +88,8 @@ export function createGatewayBindingFetch(options: GatewayBindingFetchOptions): 
   // wire, so a lexical variant can't split provider/endpoint differently than HTTPS would.
   const base = new URL(options.baseUrl);
   const basePath = base.pathname.endsWith("/") ? base.pathname : `${base.pathname}/`;
+  const universalUrl =
+      `https://workers-binding.ai/ai-gateway/universal/run/${encodeURIComponent(gateway)}`;
 
   return async (input: FetchInput, init?: RequestInit): Promise<Response> => {
     const request = input instanceof Request ? input : undefined;
@@ -117,32 +131,82 @@ export function createGatewayBindingFetch(options: GatewayBindingFetchOptions): 
     const endpoint = rest.slice(slash + 1) + parsed.search;
 
     const bodyText = await readBodyText(request, init);
-    let query: unknown;
-    try {
-      query = bodyText === undefined ? undefined : JSON.parse(bodyText);
-    } catch {
-      return unexpressible("non-JSON body");
-    }
-    if (query === undefined) {
+    if (bodyText === undefined) {
       return unexpressible("missing body");
+    }
+    if (!isSingleJsonObjectText(bodyText)) {
+      return unexpressible("body is not a single JSON object");
     }
 
     const headers = collectHeaders(request, init);
+    const envelope =
+        `[{"provider":${JSON.stringify(provider)},"endpoint":${JSON.stringify(endpoint)},` +
+        `"headers":${JSON.stringify(headers)},"query":${bodyText}}]`;
+
     // Per the fetch spec an explicit `signal: null` in init clears a Request input's signal.
     const signal = init?.signal ??
         (init && "signal" in init && init.signal === null ? undefined : request?.signal);
-    return binding.gateway(gateway).run(
-        { provider, endpoint, headers, query }, signal ? { signal } : {});
+    return binding.fetch(universalUrl, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: envelope,
+      ...(signal ? { signal } : {}),
+    });
   };
+}
+
+// JSON whitespace per RFC 8259: space, tab, line feed, carriage return.
+function isJsonWhitespace(char: string): boolean {
+  return char === " " || char === "\t" || char === "\n" || char === "\r";
+}
+
+// The body is spliced into the envelope as the `query` JSON value, so it must be exactly one
+// complete JSON object: an opening `{` whose matching close is followed by nothing but
+// whitespace, with nesting tracked across string literals. Anything looser could terminate
+// `query` early and inject envelope fields (duplicate keys override provider/endpoint) or
+// whole extra entries. A single O(n) scan enforces this without materializing the parsed tree
+// this transport exists to avoid; JSON errors *inside* the object (which cannot escape the
+// splice) still surface in the gateway's error response instead of locally.
+function isSingleJsonObjectText(text: string): boolean {
+  let i = 0;
+  while (i < text.length && isJsonWhitespace(text[i])) i++;
+  if (text[i] !== "{") return false;
+  let depth = 0;
+  let inString = false;
+  for (; i < text.length; i++) {
+    const char = text[i];
+    if (inString) {
+      if (char === "\\") i++;
+      else if (char === '"') inString = false;
+    } else if (char === '"') {
+      inString = true;
+    } else if (char === "{" || char === "[") {
+      depth++;
+    } else if (char === "}" || char === "]") {
+      depth--;
+      if (depth === 0) {
+        if (char !== "}") return false;
+        for (i++; i < text.length; i++) {
+          if (!isJsonWhitespace(text[i])) return false;
+        }
+        return true;
+      }
+    }
+  }
+  // Never closed: unbalanced nesting or an unterminated string.
+  return false;
 }
 
 async function readBodyText(request: Request | undefined, init?: RequestInit)
     : Promise<string | undefined> {
   const body = init?.body;
   if (body === undefined || body === null) {
-    // Per the fetch spec an explicit `body: null` in init clears a Request input's body.
-    if (init && "body" in init && body === null) return undefined;
-    if (request && request.body !== null) return request.clone().text();
+    // Per the fetch spec, init.body must exist AND be non-null to override, so an explicit
+    // `body: null` behaves like an absent body and inherits a Request input's body (unlike
+    // `signal`, where an explicit null clears). Read the input directly rather than cloning:
+    // unexpressible requests reject rather than replay, so nothing needs the body again, and
+    // a clone's unread tee branch would retain a buffered copy of a multi-MB body.
+    if (request && request.body !== null) return request.text();
     return undefined;
   }
   if (typeof body === "string") return body;
