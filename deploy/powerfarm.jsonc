@@ -1,0 +1,61 @@
+{
+  // Configuração desta instalação. É o único arquivo que você edita à mão.
+  // Todo o resto — quais Workers existem, que bindings cada um tem, em que ordem sobem —
+  // sai de scripts/testdata/golden-manifest.json, gerado dos wrangler.jsonc reais do repo.
+
+  // Conta Cloudflare dona de tudo.
+  // dash.cloudflare.com → qualquer domínio → coluna direita → Account ID
+  "accountId": "<CLOUDFLARE_ACCOUNT_ID>",
+
+  // Prefixo das identidades de Worker. Identidade de Worker é permanente:
+  //   router           → powerfarm
+  //   workshop-backend → powerfarm-backend
+  //   gatekeeper-<x>   → powerfarm-gk-<x>
+  // Mudar isto órfã a instalação anterior em vez de substituí-la.
+  "namePrefix": "powerfarm",
+
+  // Origem pública. O router detém este hostname e serve o frontend;
+  // todos os gatekeepers derivam seu BASE_URL daqui.
+  "publicBaseUrl": "https://powerfarm.app",
+  "route": { "customDomain": "powerfarm.app" },
+
+  // Cloudflare Access protege o hostname antes da requisição chegar no Worker.
+  // audience: dash → Zero Trust → Access → Applications → sua app → Overview → Application Audience (AUD) Tag
+  "access": {
+    "issuer": "https://<TEAM_NAME>.cloudflareaccess.com",
+    "audience": "<ACCESS_AUDIENCE>",
+    "admins": ["dan@minilab.work"]
+  },
+
+  // Gatekeepers a instalar. Os 16 existem no repo; ligar um sem credencial OAuth
+  // sobe o Worker mas ele fica inerte até você preencher os segredos.
+  //   "todos"  → os 16
+  //   lista    → só esses (context e scheduler são preinstall, entram sempre)
+  "gatekeepers": "todos",
+
+  // Segredos OAuth por gatekeeper, no formato <GK>_CLIENT_ID / <GK>_CLIENT_SECRET.
+  // NUNCA neste arquivo — vêm do ambiente (GitHub Actions secrets, ou export local).
+  // Ex.: GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET, GOOGLE_CLIENT_ID, ...
+  // Gatekeeper sem segredo definido é deployado mesmo assim, só não conecta.
+
+  // Recursos de armazenamento. null = reutiliza pelo nome se já existir, cria se não.
+  // Os nomes derivam do manifest e batem com os que já estão na conta.
+  "resources": {
+    "reuseExisting": true
+  },
+
+  // Modelos de IA. Desligado, a instalação sobe sem IA configurada.
+  "aiGateway": {
+    "enabled": false,
+    "name": "<AI_GATEWAY_NAME>",
+    "accountId": "<AI_GATEWAY_ACCOUNT_ID>",
+    "providers": ["anthropic", "openai", "google", "cloudflare"]
+  },
+
+  "observability": {
+    "enabled": true,
+    "headSamplingRate": 1,
+    "invocationLogs": false,
+    "traces": { "enabled": false, "headSamplingRate": 0.1 }
+  }
+}
